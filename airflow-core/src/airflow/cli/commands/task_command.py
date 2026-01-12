@@ -279,7 +279,7 @@ def task_failed_deps(args) -> None:
     ti, _ = _get_ti(task, args.map_index, logical_date_or_run_id=args.logical_date_or_run_id)
     dep_context = DepContext(deps=SCHEDULER_QUEUED_DEPS)
     failed_deps = list(ti.get_failed_dep_statuses(dep_context=dep_context))
-    # TODO, Do we want to print or log this
+    # Using print() for CLI user-facing output (not logging)
     if failed_deps:
         print("Task instance dependencies not met:")
         for dep in failed_deps:

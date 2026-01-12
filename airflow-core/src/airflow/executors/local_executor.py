@@ -131,7 +131,7 @@ def _execute_work(log: Logger, workload: workloads.ExecuteTask, team_conf) -> No
     # This will return the exit code of the task process, but we don't care about that, just if the
     # _supervisor_ had an error reporting the state back (which will result in an exception.)
     supervise(
-        # This is the "wrong" ti type, but it duck types the same. TODO: Create a protocol for this.
+        # workload.ti uses the workloads.TaskInstance schema which duck types to match supervisor's expected type
         ti=workload.ti,  # type: ignore[arg-type]
         dag_rel_path=workload.dag_rel_path,
         bundle_info=workload.bundle_info,

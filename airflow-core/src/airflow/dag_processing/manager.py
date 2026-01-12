@@ -841,7 +841,6 @@ class DagFileProcessorManager(LoggingMixin):
 
     @provide_session
     def _collect_results(self, session: Session = NEW_SESSION):
-        # TODO: Use an explicit session in this fn
         finished = []
         for file, proc in self._processors.items():
             if not proc.is_ready:

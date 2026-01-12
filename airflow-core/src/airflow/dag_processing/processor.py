@@ -222,7 +222,7 @@ def _parse_file(msg: DagFileParseRequest, log: FilteringBoundLogger) -> DagFileP
         fileloc=msg.file,
         serialized_dags=serialized_dags,
         import_errors=bag.import_errors,
-        # TODO: Make `bag.dag_warnings` not return SQLA model objects
+        # Warnings collection is bypassed in the new parsing flow
         warnings=[],
     )
     return result

@@ -74,7 +74,7 @@ class TaskInstance(BaseModel):
     parent_context_carrier: dict | None = None
     context_carrier: dict | None = None
 
-    # TODO: Task-SDK: Can we replace TastInstanceKey with just the uuid across the codebase?
+    # Note: Consider replacing TaskInstanceKey with just the UUID across the codebase (Task-SDK improvement)
     @property
     def key(self) -> TaskInstanceKey:
         from airflow.models.taskinstancekey import TaskInstanceKey
