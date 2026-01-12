@@ -167,7 +167,8 @@ class ExecuteCallback(BaseDagBundleWorkload):
                 name=dag_run.dag_model.bundle_name,
                 version=dag_run.bundle_version,
             )
-        fname = f"executor_callbacks/{callback.id}"  # TODO: better log file template
+        # Log file template format: callbacks/dag_id/run_id/callback_id.log
+        fname = f"callbacks/{dag_run.dag_id}/{dag_run.run_id}/{callback.id}"
 
         return cls(
             callback=Callback.model_validate(callback, from_attributes=True),

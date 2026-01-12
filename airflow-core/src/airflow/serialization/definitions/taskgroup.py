@@ -49,7 +49,7 @@ class SerializedTaskGroup(DAGNode):
     tooltip: str = attrs.field()
     default_args: dict[str, Any] = attrs.field(factory=dict)
 
-    # TODO: Are these actually useful?
+    # Used by dot_renderer.py for DAG graph visualization
     ui_color: str = attrs.field(default="CornflowerBlue")
     ui_fgcolor: str = attrs.field(default="#000")
 

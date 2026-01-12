@@ -141,7 +141,7 @@ class SerializedBaseOperator(DAGNode):
 
     trigger_rule: str | TriggerRule = "all_success"
 
-    # TODO: Remove the following, they aren't used anymore
+    # Used by dot_renderer.py for DAG graph visualization and exposed in the API
     ui_color: str = "#fff"
     ui_fgcolor: str = "#000"
 
