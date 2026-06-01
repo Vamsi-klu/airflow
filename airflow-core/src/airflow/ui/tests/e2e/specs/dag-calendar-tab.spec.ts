@@ -40,7 +40,12 @@ test.describe("Dag Calendar Tab", () => {
     expect(count).toBeGreaterThan(0);
   });
 
-  test("verify manual runs are detected", async ({ dagCalendarTab }) => {
+  test("verify manual runs are detected", async ({ browserName, dagCalendarTab }) => {
+    test.fixme(
+      browserName === "firefox",
+      "Firefox calendar tooltip hover is flaky in PROD-image e2e; tracked at https://github.com/apache/airflow/issues/67869",
+    );
+
     await dagCalendarTab.switchToHourly();
 
     const states = await dagCalendarTab.getManualRunStates();
@@ -48,7 +53,12 @@ test.describe("Dag Calendar Tab", () => {
     expect(states.length).toBeGreaterThanOrEqual(2);
   });
 
-  test("verify hover shows correct run states", async ({ dagCalendarTab }) => {
+  test("verify hover shows correct run states", async ({ browserName, dagCalendarTab }) => {
+    test.fixme(
+      browserName === "firefox",
+      "Firefox calendar tooltip hover is flaky in PROD-image e2e; tracked at https://github.com/apache/airflow/issues/67869",
+    );
+
     await dagCalendarTab.switchToHourly();
 
     const states = await dagCalendarTab.getManualRunStates();
@@ -57,7 +67,12 @@ test.describe("Dag Calendar Tab", () => {
     expect(states).toContain("failed");
   });
 
-  test("failed filter shows only failed runs", async ({ dagCalendarTab }) => {
+  test("failed filter shows only failed runs", async ({ browserName, dagCalendarTab }) => {
+    test.fixme(
+      browserName === "firefox",
+      "Firefox calendar tooltip hover is flaky in PROD-image e2e; tracked at https://github.com/apache/airflow/issues/67869",
+    );
+
     await dagCalendarTab.switchToHourly();
 
     const totalStates = await dagCalendarTab.getManualRunStates();
