@@ -30,3 +30,7 @@ class DatabricksSqlExecutionError(AirflowException):
 
 class DatabricksSqlExecutionTimeout(DatabricksSqlExecutionError):
     """Raised when a sql execution times out."""
+
+
+class DatabricksProxyConfigurationError(AirflowException):
+    """Raised when the Databricks proxy settings are malformed."""

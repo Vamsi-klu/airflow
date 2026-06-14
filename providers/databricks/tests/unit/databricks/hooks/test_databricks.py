@@ -461,6 +461,45 @@ class TestDatabricksHook:
         )
 
     @mock.patch("airflow.providers.databricks.hooks.databricks_base.requests")
+    def test_do_api_call_forwards_proxies(self, mock_requests):
+        mock_requests.get.return_value.json.return_value = {"foo": "bar"}
+        self.hook = DatabricksHook(
+            databricks_conn_id=DEFAULT_CONN_ID,
+            retry_delay=0,
+        )
+        self.hook.databricks_conn = Connection(
+            conn_id=DEFAULT_CONN_ID,
+            conn_type="databricks",
+            host=HOST,
+            login=LOGIN,
+            password=PASSWORD,
+            extra=json.dumps(
+                {
+                    "proxies": {
+                        "https": "https://https-proxy",
+                        "http": "http://http-proxy",
+                    }
+                }
+            ),
+        )
+
+        response = self.hook._do_api_call(("GET", "2.1/foo/bar"), json={"some": "param"})
+
+        assert response == {"foo": "bar"}
+        mock_requests.get.assert_called_once_with(
+            f"https://{HOST}/api/2.1/foo/bar",
+            json=None,
+            params={"some": "param"},
+            auth=HTTPBasicAuth(LOGIN, PASSWORD),
+            headers=self.hook.user_agent_header,
+            proxies={
+                "http": "http://http-proxy",
+                "https": "https://https-proxy",
+            },
+            timeout=self.hook.timeout_seconds,
+        )
+
+    @mock.patch("airflow.providers.databricks.hooks.databricks_base.requests")
     def test_create(self, mock_requests):
         mock_requests.codes.ok = 200
         mock_requests.post.return_value.json.return_value = {"job_id": JOB_ID}
@@ -1505,6 +1544,51 @@ class TestDatabricksHookConnSettings(TestDatabricksHookToken):
         assert run_page_url == {"bar": "baz"}
         mock_get.assert_called_once()
         assert mock_get.call_args.args == (f"http://{HOST}:7908/api/2.1/foo/bar",)
+
+    @pytest.mark.parametrize(
+        ("schema", "port", "expected_proxy"),
+        [("https", None, "https://https-proxy"), ("http", 7908, "http://http-proxy")],
+    )
+    @pytest.mark.asyncio
+    @mock.patch("airflow.providers.databricks.hooks.databricks_base.aiohttp.ClientSession.get")
+    async def test_async_do_api_call_uses_scheme_proxy(self, mock_get, schema, port, expected_proxy):
+        mock_get.return_value.__aenter__.return_value.json = AsyncMock(return_value={"bar": "baz"})
+
+        self.hook.databricks_conn = Connection(
+            conn_id=DEFAULT_CONN_ID,
+            conn_type="databricks",
+            host=HOST,
+            login=None,
+            password=None,
+            extra=json.dumps(
+                {
+                    "token": TOKEN,
+                    "proxies": {
+                        "http": "http://http-proxy",
+                        "https": "https://https-proxy",
+                    },
+                }
+            ),
+            schema=schema,
+            port=port,
+        )
+
+        async with self.hook:
+            run_page_url = await self.hook._a_do_api_call(("GET", "2.1/foo/bar"), {"some": "param"})
+
+        assert run_page_url == {"bar": "baz"}
+
+        expected_host = (
+            f"{schema}://{HOST}:{port}/api/2.1/foo/bar" if port else f"{schema}://{HOST}/api/2.1/foo/bar"
+        )
+        mock_get.assert_called_once_with(
+            expected_host,
+            json={"some": "param"},
+            auth=BearerAuth(TOKEN),
+            headers=self.hook.user_agent_header,
+            proxy=expected_proxy,
+            timeout=self.hook.timeout_seconds,
+        )
 
     @pytest.mark.asyncio
     @mock.patch("airflow.providers.databricks.hooks.databricks_base.aiohttp.ClientSession.get")

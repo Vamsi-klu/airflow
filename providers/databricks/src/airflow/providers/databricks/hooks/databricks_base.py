@@ -30,7 +30,9 @@ import platform
 import ssl
 import time
 from asyncio.exceptions import TimeoutError
+from collections.abc import Mapping
 from functools import cached_property
+from inspect import Parameter, signature
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlsplit
 
@@ -51,6 +53,7 @@ from tenacity import (
 
 from airflow import __version__
 from airflow.providers.common.compat.sdk import AirflowException, AirflowOptionalProviderFeatureException
+from airflow.providers.databricks.exceptions import DatabricksProxyConfigurationError
 from airflow.providers_manager import ProvidersManager
 
 try:
@@ -109,6 +112,7 @@ class BaseDatabricksHook(BaseHook):
     extra_parameters = [
         "token",
         "host",
+        "proxies",
         "use_azure_managed_identity",
         DEFAULT_AZURE_CREDENTIAL_SETTING_KEY,
         "azure_managed_identity_client_id",
@@ -436,7 +440,8 @@ class BaseDatabricksHook(BaseHook):
 
         self.log.info("Existing AAD token is expired, or going to expire soon. Refreshing...")
         try:
-            from azure.identity import DefaultAzureCredential
+            credential_class = self._get_default_azure_credential_class()
+            credential_kwargs = self._get_azure_credential_kwargs(credential_class)
 
             for attempt in self._get_retry_object():
                 with attempt:
@@ -445,7 +450,7 @@ class BaseDatabricksHook(BaseHook):
                     #
                     # While there is a WorkloadIdentityCredential class, the below class is advised by Microsoft
                     # https://learn.microsoft.com/en-us/azure/aks/workload-identity-overview
-                    token = DefaultAzureCredential().get_token(f"{resource}/.default")
+                    token = credential_class(**credential_kwargs).get_token(f"{resource}/.default")
 
                     jsn = {
                         "access_token": token.token,
@@ -479,9 +484,8 @@ class BaseDatabricksHook(BaseHook):
 
         self.log.info("Existing AAD token is expired, or going to expire soon. Refreshing...")
         try:
-            from azure.identity.aio import (
-                DefaultAzureCredential as AsyncDefaultAzureCredential,
-            )
+            credential_class = self._get_async_default_azure_credential_class()
+            credential_kwargs = self._get_azure_credential_kwargs(credential_class)
 
             for attempt in self._get_retry_object():
                 with attempt:
@@ -490,7 +494,7 @@ class BaseDatabricksHook(BaseHook):
                     #
                     # While there is a WorkloadIdentityCredential class, the below class is advised by Microsoft
                     # https://learn.microsoft.com/en-us/azure/aks/workload-identity-overview
-                    token = await AsyncDefaultAzureCredential().get_token(f"{resource}/.default")
+                    token = await credential_class(**credential_kwargs).get_token(f"{resource}/.default")
 
                     jsn = {
                         "access_token": token.token,
@@ -524,6 +528,74 @@ class BaseDatabricksHook(BaseHook):
             ]
             headers["X-Databricks-Azure-SP-Management-Token"] = mgmt_token
         return headers
+
+    def _get_proxy_config(self) -> dict[str, str]:
+        """Get normalized proxy settings from connection extras."""
+        if not isinstance(self.databricks_conn.extra_dejson, Mapping):
+            raise DatabricksProxyConfigurationError(
+                "Malformed Databricks extra configuration for proxies: expected `extra_dejson` to "
+                f"be a mapping, got {type(self.databricks_conn.extra_dejson)!r}."
+            )
+
+        if "proxies" not in self.databricks_conn.extra_dejson:
+            return {}
+
+        if not isinstance(self.databricks_conn.extra_dejson["proxies"], Mapping):
+            raise DatabricksProxyConfigurationError(
+                "Malformed Databricks proxy configuration: expected `proxies` to be a mapping, "
+                f"got {type(self.databricks_conn.extra_dejson['proxies'])!r}."
+            )
+
+        proxies = {}
+        for key, value in sorted(self.databricks_conn.extra_dejson["proxies"].items()):
+            if not isinstance(key, str):
+                raise DatabricksProxyConfigurationError(
+                    f"Malformed Databricks proxy configuration: proxy key must be a string, got {type(key)!r}."
+                )
+
+            if not isinstance(value, str):
+                raise DatabricksProxyConfigurationError(
+                    f"Malformed Databricks proxy configuration: proxy value for {key!r} must be "
+                    f"a non-empty string, got {type(value)!r}."
+                )
+
+            if not value:
+                raise DatabricksProxyConfigurationError(
+                    f"Malformed Databricks proxy configuration: proxy value for {key!r} cannot be empty."
+                )
+
+            proxies[key] = value
+
+        return proxies
+
+    def _get_azure_credential_kwargs(self, credential_class: type) -> dict[str, object]:
+        """Get kwargs for Azure credential class constructors."""
+        proxies = self._get_proxy_config()
+        if not proxies:
+            return {}
+
+        params = signature(credential_class).parameters
+        if any(param.kind == Parameter.VAR_KEYWORD for param in params.values()):
+            return {"proxies": proxies}
+
+        if "proxies" not in params:
+            return {}
+
+        return {"proxies": proxies}
+
+    @staticmethod
+    def _get_default_azure_credential_class() -> type:
+        """Return the configured DefaultAzureCredential class."""
+        from azure.identity import DefaultAzureCredential
+
+        return DefaultAzureCredential
+
+    @staticmethod
+    def _get_async_default_azure_credential_class() -> type:
+        """Return the configured async DefaultAzureCredential class."""
+        from azure.identity.aio import DefaultAzureCredential as AsyncDefaultAzureCredential
+
+        return AsyncDefaultAzureCredential
 
     async def _a_get_aad_headers(self) -> dict:
         """
@@ -1133,14 +1205,19 @@ class BaseDatabricksHook(BaseHook):
                         json,
                         headers,
                     )
-                    response = request_func(
-                        url,
-                        json=json if method in ("POST", "PATCH") else None,
-                        params=json if method == "GET" else None,
-                        auth=auth,
-                        headers=headers,
-                        timeout=self.timeout_seconds,
-                    )
+                    request_kwargs = {
+                        "json": json if method in ("POST", "PATCH") else None,
+                        "params": json if method == "GET" else None,
+                        "auth": auth,
+                        "headers": headers,
+                        "timeout": self.timeout_seconds,
+                    }
+
+                    proxy = self._get_proxy_config()
+                    if proxy:
+                        request_kwargs["proxies"] = proxy
+
+                    response = request_func(url, **request_kwargs)
                     self.log.debug("Response Status Code: %s", response.status_code)
                     self.log.debug("Response text: %s", response.text)
                     response.raise_for_status()
@@ -1197,13 +1274,19 @@ class BaseDatabricksHook(BaseHook):
                         json,
                         headers,
                     )
-                    async with request_func(
-                        url,
-                        json=json,
-                        auth=auth,
-                        headers={**headers, **self.user_agent_header},
-                        timeout=self.timeout_seconds,
-                    ) as response:
+                    proxy = self._get_proxy_config().get(urlsplit(url).scheme)
+
+                    request_kwargs = {
+                        "json": json,
+                        "auth": auth,
+                        "headers": {**headers, **self.user_agent_header},
+                        "timeout": self.timeout_seconds,
+                    }
+
+                    if proxy:
+                        request_kwargs["proxy"] = proxy
+
+                    async with request_func(url, **request_kwargs) as response:
                         self.log.debug("Response Status Code: %s", response.status)
                         self.log.debug("Response text: %s", response.text)
                         response.raise_for_status()
@@ -1227,7 +1310,7 @@ class BaseDatabricksHook(BaseHook):
     @staticmethod
     def _retryable_error(exception: BaseException) -> bool:
         if isinstance(exception, requests_exceptions.RequestException):
-            if isinstance(exception, (requests_exceptions.ConnectionError, requests_exceptions.Timeout)) or (
+            if isinstance(exception, requests_exceptions.ConnectionError | requests_exceptions.Timeout) or (
                 exception.response is not None
                 and (
                     exception.response.status_code >= 500
@@ -1244,7 +1327,7 @@ class BaseDatabricksHook(BaseHook):
             if exception.status >= 500 or exception.status == 429:
                 return True
 
-        if isinstance(exception, (ClientConnectorError, TimeoutError)):
+        if isinstance(exception, ClientConnectorError | TimeoutError):
             return True
 
         return False

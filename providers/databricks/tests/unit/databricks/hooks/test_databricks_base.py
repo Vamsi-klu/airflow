@@ -31,6 +31,7 @@ from tenacity import AsyncRetrying, Future, RetryError, retry_if_exception, stop
 
 from airflow.models import Connection
 from airflow.providers.common.compat.sdk import AirflowException
+from airflow.providers.databricks.exceptions import DatabricksProxyConfigurationError
 from airflow.providers.databricks.hooks.databricks_base import (
     DEFAULT_AZURE_CREDENTIAL_SETTING_KEY,
     DEFAULT_DATABRICKS_SCOPE,
@@ -664,6 +665,223 @@ class TestBaseDatabricksHook:
             assert token == "default_cred_token"
             mock_get_default_cred_token.assert_awaited_once_with(DEFAULT_DATABRICKS_SCOPE)
             mock_log_debug.assert_called_once_with("Using AzureDefaultCredential for authentication.")
+
+    def test_get_proxy_config_rejects_invalid_extra_type(self):
+        hook = BaseDatabricksHook()
+        for extra in ["not-a-mapping", 7, 7.0, ["http", "https"]]:
+            hook.databricks_conn = mock.Mock(extra_dejson=extra)
+
+            with pytest.raises(
+                DatabricksProxyConfigurationError,
+                match="Malformed Databricks extra configuration for proxies",
+            ):
+                hook._get_proxy_config()
+
+    def test_get_proxy_config_rejects_non_string_proxy_key_or_value(self):
+        hook = BaseDatabricksHook()
+
+        hook.databricks_conn = mock.Mock(
+            extra_dejson={
+                "proxies": {
+                    1: "http://proxy.example.com:3128",
+                }
+            }
+        )
+        with pytest.raises(
+            DatabricksProxyConfigurationError,
+            match="Malformed Databricks proxy configuration: proxy key must be a string",
+        ):
+            hook._get_proxy_config()
+
+        hook.databricks_conn = mock.Mock(
+            extra_dejson={
+                "proxies": {
+                    "http": 123,
+                }
+            }
+        )
+        with pytest.raises(
+            DatabricksProxyConfigurationError,
+            match="Malformed Databricks proxy configuration: proxy value for 'http' must be a non-empty string",
+        ):
+            hook._get_proxy_config()
+
+        hook.databricks_conn = mock.Mock(
+            extra_dejson={
+                "proxies": {
+                    "http": "",
+                }
+            }
+        )
+        with pytest.raises(
+            DatabricksProxyConfigurationError,
+            match="Malformed Databricks proxy configuration: proxy value for 'http' cannot be empty",
+        ):
+            hook._get_proxy_config()
+
+    def test_get_proxy_config_returns_normalized_mapping(self):
+        hook = BaseDatabricksHook()
+        hook.databricks_conn = mock.Mock(
+            extra_dejson={
+                "proxies": {
+                    "https": "https://https-proxy",
+                    "http": "http://http-proxy",
+                }
+            }
+        )
+
+        assert hook._get_proxy_config() == {
+            "http": "http://http-proxy",
+            "https": "https://https-proxy",
+        }
+
+    @mock.patch.object(BaseDatabricksHook, "_get_default_azure_credential_class")
+    def test_get_azure_credential_kwargs_include_proxies_for_default_credential(
+        self, mock_default_credential_class
+    ):
+        hook = BaseDatabricksHook()
+        hook.databricks_conn = mock.Mock(
+            extra_dejson={
+                "proxies": {
+                    "https": "https://https-proxy",
+                    "http": "http://http-proxy",
+                }
+            }
+        )
+        hook.oauth_tokens = {}
+
+        init_kwargs: dict[str, object] = {}
+
+        class FakeCredential:
+            def __init__(self, **kwargs: object) -> None:
+                init_kwargs.update(kwargs)
+
+            def get_token(self, *args: object, **kwargs: object) -> mock.Mock:
+                return mock.Mock(token="token", expires_on=100)
+
+        mock_default_credential_class.return_value = FakeCredential
+
+        token = hook._get_aad_token_for_default_az_credential(DEFAULT_DATABRICKS_SCOPE)
+
+        assert token == "token"
+        assert init_kwargs == {
+            "proxies": {
+                "http": "http://http-proxy",
+                "https": "https://https-proxy",
+            }
+        }
+
+    @mock.patch.object(BaseDatabricksHook, "_get_default_azure_credential_class")
+    def test_get_azure_credential_kwargs_omit_proxies_when_missing(self, mock_default_credential_class):
+        hook = BaseDatabricksHook()
+        hook.databricks_conn = mock.Mock(extra_dejson={})
+        hook.oauth_tokens = {}
+
+        init_kwargs: dict[str, object] = {}
+
+        class FakeCredential:
+            def __init__(self, **kwargs: object) -> None:
+                init_kwargs.update(kwargs)
+
+            def get_token(self, *args: object, **kwargs: object) -> mock.Mock:
+                return mock.Mock(token="token", expires_on=100)
+
+        mock_default_credential_class.return_value = FakeCredential
+
+        token = hook._get_aad_token_for_default_az_credential(DEFAULT_DATABRICKS_SCOPE)
+
+        assert token == "token"
+        assert init_kwargs == {}
+
+    @mock.patch.object(BaseDatabricksHook, "_get_default_azure_credential_class")
+    def test_get_azure_credential_kwargs_filters_unsupported_constructor_params(
+        self, mock_default_credential_class
+    ):
+        class FakeCredential:
+            def __init__(self, timeout: int = 1):
+                self.timeout = timeout
+
+            def get_token(self, *args: object, **kwargs: object) -> mock.Mock:
+                return mock.Mock(token="token", expires_on=100)
+
+        hook = BaseDatabricksHook()
+        hook.databricks_conn = mock.Mock(
+            extra_dejson={
+                "proxies": {
+                    "https": "https://https-proxy",
+                }
+            }
+        )
+        hook.oauth_tokens = {}
+
+        mock_default_credential_class.return_value = FakeCredential
+
+        token = hook._get_aad_token_for_default_az_credential(DEFAULT_DATABRICKS_SCOPE)
+
+        assert token == "token"
+
+    @pytest.mark.asyncio
+    async def test_a_get_azure_credential_kwargs_include_proxies_for_default_credential(self):
+        class FakeAsyncCredential:
+            init_kwargs: dict[str, object] = {}
+
+            def __init__(self, **kwargs: object) -> None:
+                FakeAsyncCredential.init_kwargs = kwargs
+
+            async def get_token(self, *args: object, **kwargs: object) -> mock.Mock:
+                return mock.Mock(token="token", expires_on=100)
+
+        with mock.patch.object(
+            BaseDatabricksHook,
+            "_get_async_default_azure_credential_class",
+            return_value=FakeAsyncCredential,
+        ):
+            hook = BaseDatabricksHook()
+            hook.databricks_conn = mock.Mock(
+                extra_dejson={
+                    "proxies": {
+                        "https": "https://https-proxy",
+                    }
+                }
+            )
+            hook.oauth_tokens = {}
+
+            token = await hook._a_get_aad_token_for_default_az_credential(DEFAULT_DATABRICKS_SCOPE)
+
+            assert token == "token"
+            assert FakeAsyncCredential.init_kwargs == {
+                "proxies": {
+                    "https": "https://https-proxy",
+                }
+            }
+
+    @pytest.mark.asyncio
+    async def test_a_get_azure_credential_kwargs_filters_unsupported_constructor_params(self):
+        class FakeAsyncCredential:
+            def __init__(self, timeout: int = 1):
+                self.timeout = timeout
+
+            async def get_token(self, *args: object, **kwargs: object) -> mock.Mock:
+                return mock.Mock(token="token", expires_on=100)
+
+        with mock.patch.object(
+            BaseDatabricksHook,
+            "_get_async_default_azure_credential_class",
+            return_value=FakeAsyncCredential,
+        ):
+            hook = BaseDatabricksHook()
+            hook.databricks_conn = mock.Mock(
+                extra_dejson={
+                    "proxies": {
+                        "https": "https://https-proxy",
+                    }
+                }
+            )
+            hook.oauth_tokens = {}
+
+            token = await hook._a_get_aad_token_for_default_az_credential(DEFAULT_DATABRICKS_SCOPE)
+
+            assert token == "token"
 
     @pytest.mark.asyncio
     @mock.patch(

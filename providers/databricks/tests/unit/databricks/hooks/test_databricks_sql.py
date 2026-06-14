@@ -541,7 +541,6 @@ def test_execution_timeout_exceeded(
     [(("id", "value"),)],
 )
 def test_create_timeout_thread(mock_get_conn, mock_get_requests, cursor_descriptions):
-
     cur = mock.MagicMock(
         rowcount=1,
         description=get_cursor_descriptions(cursor_descriptions),
