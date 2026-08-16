@@ -275,7 +275,7 @@ class SparkSubmitHook(BaseHook, LoggingMixin):
         yarn_rm_auth: AuthBase | None = None,
     ) -> None:
         super().__init__()
-        self._conf = conf or {}
+        self.conf = conf or {}
         self._conn_id = conn_id
         self._files = files
         self._py_files = py_files
@@ -302,7 +302,7 @@ class SparkSubmitHook(BaseHook, LoggingMixin):
         self._verbose = verbose
         self._submit_sp: Any | None = None
         self._yarn_application_id: str | None = None
-        self._kubernetes_driver_pod: str | None = None
+        self.kubernetes_driver_pod: str | None = None
         self._kubernetes_application_id: str | None = None
         self.spark_binary = spark_binary
         self._properties_file = properties_file
@@ -368,7 +368,7 @@ class SparkSubmitHook(BaseHook, LoggingMixin):
                 "`track_driver_via_k8s_api=True` requires a namespace; "
                 "set it in the connection extra as `namespace` or via `spark.kubernetes.namespace` in conf."
             )
-        if str(self._conf.get(_K8S_WAIT_APP_COMPLETION_CONF, "")).lower() == "true":
+        if str(self.conf.get(_K8S_WAIT_APP_COMPLETION_CONF, "")).lower() == "true":
             raise ValueError(
                 f"`track_driver_via_k8s_api=True` is incompatible with "
                 f"`{_K8S_WAIT_APP_COMPLETION_CONF}=true`; remove it from your conf or set it to 'false'."
@@ -462,8 +462,8 @@ class SparkSubmitHook(BaseHook, LoggingMixin):
                 "Could not load connection string %s, defaulting to %s", self._conn_id, conn_data["master"]
             )
 
-        if "spark.kubernetes.namespace" in self._conf:
-            conn_data["namespace"] = self._conf["spark.kubernetes.namespace"]
+        if "spark.kubernetes.namespace" in self.conf:
+            conn_data["namespace"] = self.conf["spark.kubernetes.namespace"]
 
         return conn_data
 
@@ -560,10 +560,10 @@ class SparkSubmitHook(BaseHook, LoggingMixin):
         # The url of the spark master
         args += ["--master", self._connection["master"]]
 
-        for key in self._conf:
-            args += ["--conf", f"{key}={self._conf[key]}"]
+        for key in self.conf:
+            args += ["--conf", f"{key}={self.conf[key]}"]
         if self._should_track_yarn_application_via_rm_api():
-            wait_app_completion = self._conf.get(self._YARN_WAIT_APP_COMPLETION_CONF)
+            wait_app_completion = self.conf.get(self._YARN_WAIT_APP_COMPLETION_CONF)
             if wait_app_completion is not None:
                 if str(wait_app_completion).strip().lower() != "false":
                     raise ValueError(
@@ -642,7 +642,7 @@ class SparkSubmitHook(BaseHook, LoggingMixin):
             args += ["--deploy-mode", self._connection["deploy_mode"]]
 
         if self._should_track_driver_via_k8s_api():
-            if _K8S_WAIT_APP_COMPLETION_CONF not in self._conf:
+            if _K8S_WAIT_APP_COMPLETION_CONF not in self.conf:
                 args += ["--conf", f"{_K8S_WAIT_APP_COMPLETION_CONF}=false"]
 
         return args
@@ -857,13 +857,13 @@ class SparkSubmitHook(BaseHook, LoggingMixin):
                 # "pod name: <name>-driver" and "submission ID spark:<name>-driver"
                 match_driver_pod = re.search(r"\s*pod name: ((.+?)-([a-z0-9]+)-driver$)", line)
                 if match_driver_pod:
-                    self._kubernetes_driver_pod = match_driver_pod.group(1)
-                    self.log.info("Identified spark driver pod: %s", self._kubernetes_driver_pod)
-                if not self._kubernetes_driver_pod:
+                    self.kubernetes_driver_pod = match_driver_pod.group(1)
+                    self.log.info("Identified spark driver pod: %s", self.kubernetes_driver_pod)
+                if not self.kubernetes_driver_pod:
                     match_submission_id = re.search(r"submission ID spark:(.+?-driver)", line)
                     if match_submission_id:
-                        self._kubernetes_driver_pod = match_submission_id.group(1)
-                        self.log.info("Identified spark driver pod: %s", self._kubernetes_driver_pod)
+                        self.kubernetes_driver_pod = match_submission_id.group(1)
+                        self.log.info("Identified spark driver pod: %s", self.kubernetes_driver_pod)
 
                 match_application_id = re.search(r"\s*spark-app-selector -> (spark-([a-z0-9]+)), ", line)
                 if match_application_id:
@@ -1183,7 +1183,7 @@ class SparkSubmitHook(BaseHook, LoggingMixin):
         or ``None`` if the pod vanished mid-poll (404 — likely deleted by ``on_kill``).
         Raises ``RuntimeError`` on failure phases or unrecoverable API errors.
         """
-        pod_name = self._kubernetes_driver_pod
+        pod_name = self.kubernetes_driver_pod
         namespace = self._connection["namespace"]
         app_id = self._kubernetes_application_id or pod_name
 
@@ -1314,19 +1314,19 @@ class SparkSubmitHook(BaseHook, LoggingMixin):
         """Delete the Kubernetes driver pod, logging a warning on failure."""
         import kubernetes
 
-        self.log.info("Deleting driver pod %s on Kubernetes", self._kubernetes_driver_pod)
+        self.log.info("Deleting driver pod %s on Kubernetes", self.kubernetes_driver_pod)
         try:
             client = kube_client.get_kube_client()
             client.delete_namespaced_pod(
-                self._kubernetes_driver_pod,
+                self.kubernetes_driver_pod,
                 self._connection["namespace"],
                 body=kubernetes.client.V1DeleteOptions(),
                 pretty=True,
             )
-            self.log.info("Deleted driver pod %s", self._kubernetes_driver_pod)
+            self.log.info("Deleted driver pod %s", self.kubernetes_driver_pod)
         except kube_client.ApiException:
             self.log.exception(
-                "Exception when attempting to delete driver pod %s", self._kubernetes_driver_pod
+                "Exception when attempting to delete driver pod %s", self.kubernetes_driver_pod
             )
 
     def on_kill(self) -> None:
@@ -1342,7 +1342,7 @@ class SparkSubmitHook(BaseHook, LoggingMixin):
                     "Spark driver %s killed with return code: %s", self._driver_id, driver_kill.wait()
                 )
 
-        if self._should_track_driver_via_k8s_api() and self._kubernetes_driver_pod:
+        if self._should_track_driver_via_k8s_api() and self.kubernetes_driver_pod:
             # spark-submit exits early under waitAppCompletion=false, so _submit_sp.poll() is
             # not None during the poll loop — the deletion block below is skipped on kill.
             self._delete_driver_pod()
@@ -1377,7 +1377,7 @@ class SparkSubmitHook(BaseHook, LoggingMixin):
                 ) as yarn_kill:
                     self.log.info("YARN app killed with return code: %s", yarn_kill.wait())
 
-            if self._kubernetes_driver_pod:
+            if self.kubernetes_driver_pod:
                 self._delete_driver_pod()
 
         # Opt-in REST kill path — uses the same RM endpoint as polling, no
@@ -1388,19 +1388,6 @@ class SparkSubmitHook(BaseHook, LoggingMixin):
             self.kill_yarn_application(self._yarn_application_id)
 
         self._run_post_submit_commands()
-
-    @property
-    def conf(self) -> dict[str, Any]:
-        """Return the live Spark conf dict (not a copy); callers may mutate keys in place."""
-        return self._conf
-
-    @property
-    def kubernetes_driver_pod(self) -> str | None:
-        return self._kubernetes_driver_pod
-
-    @kubernetes_driver_pod.setter
-    def kubernetes_driver_pod(self, value: str | None) -> None:
-        self._kubernetes_driver_pod = value
 
     @property
     def yarn_application_id(self) -> str | None:
