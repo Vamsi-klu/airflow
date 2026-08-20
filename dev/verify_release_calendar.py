@@ -22,6 +22,7 @@
 #     "requests",
 #     "beautifulsoup4",
 #     "icalendar",
+#     "python-dateutil",
 #     "rich",
 # ]
 # ///
@@ -43,12 +44,13 @@ import sys
 import time
 import unicodedata
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 import requests
 from bs4 import BeautifulSoup
+from dateutil.rrule import rrulestr
 from icalendar import Calendar
 from rich.console import Console
 
@@ -398,6 +400,71 @@ def parse_table(table: Any, release_type: str) -> list[Release]:
     return releases
 
 
+def as_naive_datetime(value: Any) -> datetime:
+    """Normalize icalendar date/datetime values to a naive datetime."""
+    if isinstance(value, datetime):
+        return value.replace(tzinfo=None) if value.tzinfo is not None else value
+    if isinstance(value, date):
+        return datetime.combine(value, datetime.min.time())
+    raise TypeError(f"Unsupported calendar date value: {type(value)!r}")
+
+
+def expand_recurring_component(component: Any, overridden_dates: set[date]) -> list[CalendarEntry]:
+    """Expand an RRULE master event, skipping dates that have explicit overrides."""
+    dtstart = component.decoded("dtstart")
+    start = as_naive_datetime(dtstart)
+    rrule = component.get("RRULE")
+    if rrule is None:
+        return []
+    try:
+        rule = rrulestr(rrule.to_ical().decode(), dtstart=start)
+    except ValueError:
+        entry = parse_calendar_component(component)
+        return [entry] if entry else []
+
+    summary = str(component.get("summary", ""))
+    description = component.get("description", "")
+    horizon = datetime.now() + timedelta(days=400)
+    entries: list[CalendarEntry] = []
+    for occurrence in rule:
+        occ = as_naive_datetime(occurrence)
+        if occ > horizon:
+            break
+        if occ.date() in overridden_dates:
+            continue
+        entries.append(
+            CalendarEntry(
+                summary=summary,
+                start_date=occ,
+                description=str(description) if description else None,
+            )
+        )
+    return entries
+
+
+def parse_calendar_data(calendar_data: bytes) -> list[CalendarEntry]:
+    """Parse VEVENTs from an iCal document, expanding recurring series."""
+    calendar = Calendar.from_ical(calendar_data)
+    components = [component for component in calendar.walk() if component.name == "VEVENT"]
+    overridden_dates: dict[str, set[date]] = {}
+    for component in components:
+        recurrence_id = component.get("RECURRENCE-ID")
+        uid = str(component.get("UID", ""))
+        if recurrence_id:
+            overridden_dates.setdefault(uid, set()).add(as_naive_datetime(recurrence_id.dt).date())
+
+    entries: list[CalendarEntry] = []
+    for component in components:
+        uid = str(component.get("UID", ""))
+        if component.get("RRULE") and not component.get("RECURRENCE-ID"):
+            entries.extend(expand_recurring_component(component, overridden_dates.get(uid, set())))
+            continue
+        entry = parse_calendar_component(component)
+        if entry:
+            entries.append(entry)
+    return entries
+
+
 def parse_calendar_component(component: Any) -> CalendarEntry | None:
     """Parse a calendar component into a CalendarEntry."""
     if component.name != "VEVENT":
@@ -449,16 +516,21 @@ def fetch_calendar_entries() -> list[CalendarEntry]:
                 sys.exit(1)
 
     console.print("[cyan]Parsing calendar entries...[/cyan]")
-    calendar = Calendar.from_ical(calendar_data)
-    entries = []
-
-    for component in calendar.walk():
-        entry = parse_calendar_component(component)
-        if entry:
-            entries.append(entry)
-
+    entries = parse_calendar_data(calendar_data)
     console.print(f"[green]Found {len(entries)} calendar entries[/green]")
     return entries
+
+
+def select_releases_to_verify(releases: list[Release], *, include_past: bool) -> list[Release]:
+    """Drop past wiki rows unless the caller asked to include them."""
+    if include_past:
+        return releases
+    today = date.today()
+    upcoming = [release for release in releases if release.date.date() >= today]
+    skipped = len(releases) - len(upcoming)
+    if skipped:
+        console.print(f"[dim]Skipping {skipped} past release(s)[/dim]")
+    return upcoming
 
 
 def normalize_name(name: str) -> str:
@@ -616,6 +688,14 @@ def load_html_content(args: argparse.Namespace) -> str:
     return html_content
 
 
+def load_calendar_entries(args: argparse.Namespace) -> list[CalendarEntry]:
+    """Load calendar entries from a local iCal file or the public feed."""
+    if args.load_ics:
+        console.print(f"[cyan]Loading calendar from file:[/cyan] {args.load_ics}")
+        return parse_calendar_data(Path(args.load_ics).read_bytes())
+    return fetch_calendar_entries()
+
+
 def validate_releases(releases: list[Release]) -> None:
     """Validate that releases were found, exit if not."""
     if not releases:
@@ -651,17 +731,27 @@ def main():
     parser.add_argument(
         "--load-html", metavar="FILE", help="Load Confluence HTML from a file instead of fetching"
     )
+    parser.add_argument(
+        "--load-ics", metavar="FILE", help="Load calendar entries from an iCal file instead of fetching"
+    )
+    parser.add_argument(
+        "--include-past",
+        action="store_true",
+        help="Also verify wiki rows whose dates are already in the past",
+    )
     args = parser.parse_args()
 
-    # Fetch and parse data
     html_content = load_html_content(args)
     releases = parse_confluence_releases(html_content)
     validate_releases(releases)
+    releases = select_releases_to_verify(releases, include_past=args.include_past)
+    if not releases:
+        console.print("[bold green]✓ No current or future releases to verify[/bold green]")
+        sys.exit(0)
 
-    calendar_entries = fetch_calendar_entries()
+    calendar_entries = load_calendar_entries(args)
     validate_calendar_entries(calendar_entries)
 
-    # Verify and exit with appropriate code
     all_matched = verify_releases(releases, calendar_entries)
     print_final_result(all_matched)
 

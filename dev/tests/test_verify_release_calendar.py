@@ -22,6 +22,7 @@ from datetime import datetime
 from pathlib import Path
 
 import pytest
+import time_machine
 
 SCRIPT_PATH = Path(__file__).resolve().parents[1] / "verify_release_calendar.py"
 
@@ -138,3 +139,43 @@ def test_matching_entry_still_requires_date_type_and_manager(calendar_mod):
     assert calendar_mod.is_matching_entry(release, matching)
     assert not calendar_mod.is_matching_entry(release, other_manager)
     assert not calendar_mod.is_matching_entry(release, other_day)
+
+
+RECURRING_ICS = b"""BEGIN:VCALENDAR
+VERSION:2.0
+BEGIN:VEVENT
+DTSTART;VALUE=DATE:20260811
+RRULE:FREQ=WEEKLY;INTERVAL=2;BYDAY=TU;UNTIL=20260908
+UID:providers-series@example.com
+SUMMARY:Providers release - ?
+END:VEVENT
+BEGIN:VEVENT
+DTSTART;VALUE=DATE:20260818
+RECURRENCE-ID;VALUE=DATE:20260811
+UID:providers-series@example.com
+SUMMARY:Providers release - Hussein Awala
+END:VEVENT
+END:VCALENDAR
+"""
+
+
+def test_parse_calendar_data_expands_rrule_and_keeps_overrides(calendar_mod):
+    entries = calendar_mod.parse_calendar_data(RECURRING_ICS)
+    by_date = {item.start_date.strftime("%Y-%m-%d"): item.summary for item in entries}
+
+    assert "2026-08-11" not in by_date
+    assert by_date["2026-08-18"] == "Providers release - Hussein Awala"
+    assert by_date["2026-08-25"] == "Providers release - ?"
+
+
+@time_machine.travel("2026-08-20", tick=False)
+def test_select_releases_to_verify_skips_past_rows(calendar_mod):
+    past = calendar_mod.Release("Providers", "2026.08.18", datetime(2026, 8, 18), "Hussein")
+    today = calendar_mod.Release("Providers", "2026.08.20", datetime(2026, 8, 20), "Jarek")
+    future = calendar_mod.Release("Providers", "2026.08.25", datetime(2026, 8, 25), "Niko")
+
+    upcoming = calendar_mod.select_releases_to_verify([past, today, future], include_past=False)
+    assert [item.date.strftime("%Y-%m-%d") for item in upcoming] == ["2026-08-20", "2026-08-25"]
+
+    all_rows = calendar_mod.select_releases_to_verify([past, today, future], include_past=True)
+    assert len(all_rows) == 3
