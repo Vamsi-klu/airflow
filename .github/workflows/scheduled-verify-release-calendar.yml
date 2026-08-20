@@ -49,11 +49,13 @@ jobs:
         run: uv run dev/verify_release_calendar.py
       # yamllint disable rule:line-length
       - name: "Notify Slack on failure"
-        if: failure()
+        if: failure() && env.SLACK_BOT_TOKEN != ''
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
         uses: slackapi/slack-github-action@dcb1066f776dd043e64d0e8ba94ca15cc7e1875d
         with:
           method: chat.postMessage
-          token: ${{ secrets.SLACK_BOT_TOKEN }}
+          token: ${{ env.SLACK_BOT_TOKEN }}
           payload: |
             channel: "release-management"
             text: >-

@@ -38,8 +38,10 @@ Calendar iCal: https://calendar.google.com/calendar/ical/c_de214e92df3b759779cb6
 from __future__ import annotations
 
 import argparse
+import re
 import sys
 import time
+import unicodedata
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -127,51 +129,60 @@ def get_release_sections() -> dict[str, list[str]]:
     """Return the mapping of release types to their possible section names."""
     return {
         "Airflow Ctl": ["Airflow Ctl", "airflow-ctl", "airflow ctl"],
-        "Providers": [
-            "Support for Airflow in Providers",
-            "Provider Releases",
-            "Providers",
-            "Provider",
-            "provider release",
-        ],
+        "Providers": ["Provider Releases", "provider release"],
     }
 
 
 def find_table_for_heading(heading: Any) -> Any | None:
-    """Find the table associated with a heading."""
-    # Try to find table as sibling first
-    current = heading.find_next_sibling()
-    while current:
-        if current.name == "table":
-            console.print("  [dim]Found table directly after heading[/dim]")
+    """Find the table that belongs to a heading, without crossing later headings."""
+    current = heading.find_next()
+    while current is not None:
+        name = getattr(current, "name", None)
+        if name in ["h1", "h2", "h3", "h4", "h5"]:
+            return None
+        if name == "table":
+            console.print("  [dim]Found table after heading[/dim]")
             return current
-        if current.name in ["h1", "h2", "h3", "h4", "h5"]:
-            # Stop if we hit another heading
-            break
-        current = current.find_next_sibling()
+        current = current.find_next()
+    return None
 
-    # If no table found as sibling, try finding next table in document
-    next_table = heading.find_next("table")
-    if next_table:
-        console.print("  [dim]Found table via find_next[/dim]")
-        return next_table
 
+def heading_matches_section(heading_text: str, section_name: str) -> bool:
+    """Return True if a heading belongs to the requested release section."""
+    normalized_heading = heading_text.lower().strip()
+    normalized_section = section_name.lower().strip()
+    if normalized_heading == normalized_section:
+        return True
+    if normalized_heading.startswith("support for"):
+        return False
+    return normalized_section in normalized_heading
+
+
+def find_heading_for_section(headings: list[Any], section_names: list[str]) -> Any | None:
+    """Prefer an exact heading match, then a conservative substring match."""
+    for heading in headings:
+        heading_text = heading.get_text(strip=True)
+        if any(heading_text.lower().strip() == name.lower().strip() for name in section_names):
+            return heading
+    for heading in headings:
+        heading_text = heading.get_text(strip=True)
+        if any(heading_matches_section(heading_text, name) for name in section_names):
+            return heading
     return None
 
 
 def find_section_and_parse(soup: BeautifulSoup, release_type: str, section_names: list[str]) -> list[Release]:
     """Find a section by name and parse its table."""
     headings = soup.find_all(["h1", "h2", "h3", "h4", "h5"])
-    for section_name in section_names:
-        for heading in headings:
-            heading_text = heading.get_text(strip=True)
-            if section_name.lower() in heading_text.lower():
-                console.print(f"[green]Found section:[/green] {heading_text}")
-                table = find_table_for_heading(heading)
-                if table is not None:
-                    return parse_table(table, release_type)
-                break
-    return []
+    heading = find_heading_for_section(headings, section_names)
+    if heading is None:
+        return []
+    heading_text = heading.get_text(strip=True)
+    console.print(f"[green]Found section:[/green] {heading_text}")
+    table = find_table_for_heading(heading)
+    if table is None:
+        return []
+    return parse_table(table, release_type)
 
 
 def parse_confluence_releases(html_content: str) -> list[Release]:
@@ -189,7 +200,7 @@ def parse_confluence_releases(html_content: str) -> list[Release]:
         if section_releases:
             releases.extend(section_releases)
         else:
-            console.print(f"[yellow]Could not find section for {release_type}[/yellow]")
+            console.print(f"[yellow]No concrete {release_type} releases parsed[/yellow]")
 
     console.print(f"[green]Found {len(releases)} releases in Confluence[/green]")
     return releases
@@ -211,15 +222,21 @@ def find_column_indices(headers: list[str]) -> tuple[int | None, int | None, int
     """Find the indices of version, date, and manager columns."""
     version_idx = None
     date_idx = None
+    cut_date_idx = None
     manager_idx = None
 
     for idx, header in enumerate(headers):
-        if "version" in header and "suffix" not in header:
+        if version_idx is None and "version" in header and "suffix" not in header:
             version_idx = idx
-        elif any(word in header for word in ["date", "cut date", "planned cut date"]):
+        if "cut" in header and "date" in header:
+            cut_date_idx = idx
+        elif date_idx is None and "date" in header:
             date_idx = idx
-        elif any(word in header for word in ["manager", "release manager"]):
+        if manager_idx is None and "manager" in header:
             manager_idx = idx
+
+    if cut_date_idx is not None:
+        date_idx = cut_date_idx
 
     console.print(
         f"  [dim]Column mapping - version: {version_idx}, date: {date_idx}, manager: {manager_idx}[/dim]"
@@ -227,7 +244,7 @@ def find_column_indices(headers: list[str]) -> tuple[int | None, int | None, int
     return version_idx, date_idx, manager_idx
 
 
-def parse_date_string(date_str: str) -> datetime | None:
+def parse_date_string(date_str: str, *, log_failures: bool = True) -> datetime | None:
     """Parse a date string in various formats."""
     date_formats = [
         "%d %b %Y",  # 09 Dec 2025
@@ -251,9 +268,10 @@ def parse_date_string(date_str: str) -> datetime | None:
         except ValueError:
             continue
 
-    console.print(
-        f"  [yellow]Could not parse date:[/yellow] '{date_str}' (tried {len(date_formats)} formats)"
-    )
+    if log_failures:
+        console.print(
+            f"  [yellow]Could not parse date:[/yellow] '{date_str}' (tried {len(date_formats)} formats)"
+        )
     return None
 
 
@@ -262,6 +280,37 @@ def extract_manager_first_name(release_manager: str) -> str:
     if "+" in release_manager:
         return release_manager.split("+")[0].strip().split()[0]
     return release_manager.split()[0] if release_manager else ""
+
+
+def extract_notes(cells: list[Any], headers: list[str]) -> str:
+    """Return the notes/scope cell when present."""
+    for idx, header in enumerate(headers):
+        if "note" in header or "scope" in header:
+            if idx < len(cells):
+                return cells[idx].get_text(strip=True)
+            return ""
+    return cells[-1].get_text(strip=True) if cells else ""
+
+
+def is_placeholder_version(version: str) -> bool:
+    """Return True for tentative versions that are not yet a real release."""
+    normalized = version.strip().lower()
+    return "?" in normalized or normalized in {"tbd", "n/a", "-"}
+
+
+def should_skip_release_row(date_str: str, release_manager: str, version: str | None, notes: str) -> bool:
+    """Skip rows that are not concrete planned releases."""
+    if not date_str:
+        return True
+    if not release_manager:
+        return True
+    if parse_date_string(release_manager, log_failures=False):
+        return True
+    if "no release" in notes.lower():
+        return True
+    if version is not None and is_placeholder_version(version):
+        return True
+    return False
 
 
 def generate_version_from_date(date: datetime) -> str:
@@ -276,6 +325,7 @@ def parse_table_row(
     date_idx: int | None,
     manager_idx: int | None,
     release_type: str,
+    headers: list[str],
 ) -> Release | None:
     """Parse a single table row into a Release object."""
     try:
@@ -283,10 +333,10 @@ def parse_table_row(
         date_str = cells[date_idx].get_text(strip=True) if date_idx is not None else ""
         release_manager = cells[manager_idx].get_text(strip=True) if manager_idx is not None else ""
         version = cells[version_idx].get_text(strip=True) if version_idx is not None else None
+        notes = extract_notes(cells, headers)
 
-        # Skip empty rows
-        if not date_str or not release_manager:
-            console.print(f"  [dim]Row {row_num}: Skipping empty row[/dim]")
+        if should_skip_release_row(date_str, release_manager, version, notes):
+            console.print(f"  [dim]Row {row_num}: Skipping non-release row[/dim]")
             return None
 
         # Parse date
@@ -341,7 +391,7 @@ def parse_table(table: Any, release_type: str) -> list[Release]:
             console.print(f"  [dim]Row {i}: Skipping (not enough cells)[/dim]")
             continue
 
-        release = parse_table_row(cells, i, version_idx, date_idx, manager_idx, release_type)
+        release = parse_table_row(cells, i, version_idx, date_idx, manager_idx, release_type, headers)
         if release:
             releases.append(release)
 
@@ -413,8 +463,6 @@ def fetch_calendar_entries() -> list[CalendarEntry]:
 
 def normalize_name(name: str) -> str:
     """Normalize a name by removing accents and converting to lowercase."""
-    import unicodedata
-
     # Normalize unicode characters (NFD = decompose, then filter out combining marks)
     nfd = unicodedata.normalize("NFD", name)
     # Remove combining characters (accents)
@@ -454,8 +502,6 @@ def check_version_match(version: str, summary: str) -> bool:
 
 def check_manager_match(manager_name: str, summary: str) -> bool:
     """Check if manager's name appears in the calendar entry summary."""
-    import re
-
     normalized_manager = normalize_name(manager_name)
     normalized_summary = normalize_name(summary)
 
