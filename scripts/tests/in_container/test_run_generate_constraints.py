@@ -21,6 +21,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+import requests
 import run_generate_constraints as m
 
 
@@ -223,6 +224,56 @@ class TestFindNewestVersionInPypi:
         monkeypatch.setattr(m.requests, "get", lambda url, timeout: _FakeResponse({}, status_code=404))
 
         assert m.find_newest_version_in_pypi("apache-airflow-providers-brand-new", "3.10", True) is None
+
+    @pytest.mark.parametrize(
+        "error",
+        [
+            requests.exceptions.ConnectionError("Connection reset by peer"),
+            requests.exceptions.Timeout("timed out"),
+        ],
+        ids=["connection-reset", "timeout"],
+    )
+    def test_retries_a_transient_pypi_error_then_returns_the_newest_version(self, monkeypatch, error):
+        calls = {"n": 0}
+        sleeps: list[float] = []
+
+        def flaky_get(url, timeout):
+            calls["n"] += 1
+            if calls["n"] < 3:
+                raise error
+            return _FakeResponse({"releases": {"1.0.0": [_file()], "1.1.0": [_file()]}})
+
+        monkeypatch.setattr(m.requests, "get", flaky_get)
+        monkeypatch.setattr(m.time, "sleep", sleeps.append)
+
+        newest = m.find_newest_version_in_pypi("apache-airflow-providers-amazon", "3.10", False)
+
+        assert newest == "1.1.0"
+        assert calls["n"] == 3
+        assert sleeps == [1.0, 2.0]
+
+    @pytest.mark.parametrize(
+        "error",
+        [
+            requests.exceptions.ConnectionError("Connection reset by peer"),
+            requests.exceptions.Timeout("timed out"),
+        ],
+        ids=["connection-reset", "timeout"],
+    )
+    def test_gives_up_after_exhausted_pypi_retries(self, monkeypatch, error):
+        calls = {"n": 0}
+
+        def always_fail(url, timeout):
+            calls["n"] += 1
+            raise error
+
+        monkeypatch.setattr(m.requests, "get", always_fail)
+        monkeypatch.setattr(m.time, "sleep", lambda _: None)
+
+        with pytest.raises(type(error), match=str(error)):
+            m.find_newest_version_in_pypi("apache-airflow-providers-amazon", "3.10", False)
+
+        assert calls["n"] == m.PYPI_LOOKUP_ATTEMPTS
 
 
 class TestBuildPinnedProviderRequirements:
