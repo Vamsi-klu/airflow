@@ -21,6 +21,7 @@ import ast
 import json
 import os
 import sys
+import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime
@@ -45,6 +46,9 @@ PYTHON_VERSION = os.environ.get("PYTHON_MAJOR_MINOR_VERSION", "3.10")
 GENERATED_PROVIDER_DEPENDENCIES_FILE = AIRFLOW_ROOT_PATH / "generated" / "provider_dependencies.json"
 PYPI_JSON_API_URL = "https://pypi.org/pypi/{distribution}/json"
 PYPI_LOOKUP_PARALLELISM = 8
+# A single dropped connection used to fail the whole generate-constraints job.
+PYPI_LOOKUP_ATTEMPTS = 4
+PYPI_LOOKUP_BACKOFF_SECONDS = 1.0
 
 
 def _read_version_from_pyproject(pyproject_path: Path) -> str:
@@ -486,6 +490,24 @@ def is_file_installable(pypi_file: dict, target_python: Version) -> bool:
         return True
 
 
+def _get_pypi_json(distribution: str) -> requests.Response:
+    """GET the PyPI JSON document, retrying dropped connections and timeouts."""
+    url = PYPI_JSON_API_URL.format(distribution=distribution)
+    for attempt in range(1, PYPI_LOOKUP_ATTEMPTS + 1):
+        try:
+            return requests.get(url, timeout=60)
+        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as error:
+            if attempt == PYPI_LOOKUP_ATTEMPTS:
+                raise
+            wait = PYPI_LOOKUP_BACKOFF_SECONDS * (2 ** (attempt - 1))
+            console.print(
+                f"[yellow]PyPI lookup for {distribution} failed ({error}); "
+                f"retrying in {wait:.1f}s (attempt {attempt}/{PYPI_LOOKUP_ATTEMPTS})."
+            )
+            time.sleep(wait)
+    raise RuntimeError(f"PyPI lookup for {distribution} exhausted retries")
+
+
 def find_newest_version_in_pypi(
     distribution: str, python_version: str, allow_pre_releases: bool
 ) -> str | None:
@@ -499,7 +521,7 @@ def find_newest_version_in_pypi(
     (nothing installable at all, e.g. a provider whose first release is still in this wave) leaves
     the distribution unpinned rather than pinned to a version that cannot be had.
     """
-    response = requests.get(PYPI_JSON_API_URL.format(distribution=distribution), timeout=60)
+    response = _get_pypi_json(distribution)
     if response.status_code == 404:
         console.print(f"[yellow]{distribution} is not published in PyPI - leaving it unpinned.")
         return None

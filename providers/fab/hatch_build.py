@@ -19,6 +19,7 @@ from __future__ import annotations
 import logging
 import os
 import shutil
+import sys
 from collections.abc import Callable, Iterable
 from pathlib import Path
 from subprocess import run
@@ -31,6 +32,28 @@ from hatchling.plugin.manager import PluginManager
 log = logging.getLogger(__name__)
 log_level = logging.getLevelName(os.getenv("CUSTOM_AIRFLOW_BUILD_LOG_LEVEL", "INFO"))
 log.setLevel(log_level)
+
+# prek uses this when a generator hook rewrites files and exits 0.
+_PREK_FILES_MODIFIED = "files were modified by this hook"
+
+
+def run_prek_compile(cmd: list[str], *, cwd: str) -> None:
+    """
+    Run a prek compile hook used as a build step.
+
+    prek exits 1 when the hook rewrites tracked files. That is expected after a
+    clean FAB rebuild because webpack refreshes LICENSES-ui.txt.
+    """
+    result = run(cmd, cwd=cwd, check=False, capture_output=True, text=True)
+    if result.stdout:
+        print(result.stdout, end="")
+    if result.stderr:
+        print(result.stderr, end="", file=sys.stderr)
+    if result.returncode == 0:
+        return
+    if result.returncode == 1 and _PREK_FILES_MODIFIED in f"{result.stdout}{result.stderr}":
+        return
+    raise RuntimeError(f"Command {cmd} failed with exit status {result.returncode}")
 
 
 class CustomBuild(BuilderInterface[BuilderConfig, PluginManager]):
@@ -65,6 +88,6 @@ class CustomBuild(BuilderInterface[BuilderConfig, PluginManager]):
         work_dir = Path(self.root).parents[1].resolve()
         cmd = ["prek", "run", "compile-fab-assets", "--all-files"]
         log.warning("Running command: %s", " ".join(cmd))
-        run(cmd, cwd=work_dir.as_posix(), check=True)
+        run_prek_compile(cmd, cwd=work_dir.as_posix())
         dist_path = Path(self.root) / "src" / "airflow" / "providers" / "fab" / "www" / "static" / "dist"
         return dist_path.resolve().as_posix()
