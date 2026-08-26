@@ -22,6 +22,7 @@
 #     "requests",
 #     "beautifulsoup4",
 #     "icalendar",
+#     "python-dateutil",
 #     "rich",
 # ]
 # ///
@@ -38,15 +39,18 @@ Calendar iCal: https://calendar.google.com/calendar/ical/c_de214e92df3b759779cb6
 from __future__ import annotations
 
 import argparse
+import re
 import sys
 import time
+import unicodedata
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 import requests
 from bs4 import BeautifulSoup
+from dateutil.rrule import rrulestr
 from icalendar import Calendar
 from rich.console import Console
 
@@ -127,51 +131,60 @@ def get_release_sections() -> dict[str, list[str]]:
     """Return the mapping of release types to their possible section names."""
     return {
         "Airflow Ctl": ["Airflow Ctl", "airflow-ctl", "airflow ctl"],
-        "Providers": [
-            "Support for Airflow in Providers",
-            "Provider Releases",
-            "Providers",
-            "Provider",
-            "provider release",
-        ],
+        "Providers": ["Provider Releases", "provider release"],
     }
 
 
 def find_table_for_heading(heading: Any) -> Any | None:
-    """Find the table associated with a heading."""
-    # Try to find table as sibling first
-    current = heading.find_next_sibling()
-    while current:
-        if current.name == "table":
-            console.print("  [dim]Found table directly after heading[/dim]")
+    """Find the table that belongs to a heading, without crossing later headings."""
+    current = heading.find_next()
+    while current is not None:
+        name = getattr(current, "name", None)
+        if name in ["h1", "h2", "h3", "h4", "h5"]:
+            return None
+        if name == "table":
+            console.print("  [dim]Found table after heading[/dim]")
             return current
-        if current.name in ["h1", "h2", "h3", "h4", "h5"]:
-            # Stop if we hit another heading
-            break
-        current = current.find_next_sibling()
+        current = current.find_next()
+    return None
 
-    # If no table found as sibling, try finding next table in document
-    next_table = heading.find_next("table")
-    if next_table:
-        console.print("  [dim]Found table via find_next[/dim]")
-        return next_table
 
+def heading_matches_section(heading_text: str, section_name: str) -> bool:
+    """Return True if a heading belongs to the requested release section."""
+    normalized_heading = heading_text.lower().strip()
+    normalized_section = section_name.lower().strip()
+    if normalized_heading == normalized_section:
+        return True
+    if normalized_heading.startswith("support for"):
+        return False
+    return normalized_section in normalized_heading
+
+
+def find_heading_for_section(headings: list[Any], section_names: list[str]) -> Any | None:
+    """Prefer an exact heading match, then a conservative substring match."""
+    for heading in headings:
+        heading_text = heading.get_text(strip=True)
+        if any(heading_text.lower().strip() == name.lower().strip() for name in section_names):
+            return heading
+    for heading in headings:
+        heading_text = heading.get_text(strip=True)
+        if any(heading_matches_section(heading_text, name) for name in section_names):
+            return heading
     return None
 
 
 def find_section_and_parse(soup: BeautifulSoup, release_type: str, section_names: list[str]) -> list[Release]:
     """Find a section by name and parse its table."""
     headings = soup.find_all(["h1", "h2", "h3", "h4", "h5"])
-    for section_name in section_names:
-        for heading in headings:
-            heading_text = heading.get_text(strip=True)
-            if section_name.lower() in heading_text.lower():
-                console.print(f"[green]Found section:[/green] {heading_text}")
-                table = find_table_for_heading(heading)
-                if table is not None:
-                    return parse_table(table, release_type)
-                break
-    return []
+    heading = find_heading_for_section(headings, section_names)
+    if heading is None:
+        return []
+    heading_text = heading.get_text(strip=True)
+    console.print(f"[green]Found section:[/green] {heading_text}")
+    table = find_table_for_heading(heading)
+    if table is None:
+        return []
+    return parse_table(table, release_type)
 
 
 def parse_confluence_releases(html_content: str) -> list[Release]:
@@ -189,7 +202,7 @@ def parse_confluence_releases(html_content: str) -> list[Release]:
         if section_releases:
             releases.extend(section_releases)
         else:
-            console.print(f"[yellow]Could not find section for {release_type}[/yellow]")
+            console.print(f"[yellow]No concrete {release_type} releases parsed[/yellow]")
 
     console.print(f"[green]Found {len(releases)} releases in Confluence[/green]")
     return releases
@@ -211,15 +224,21 @@ def find_column_indices(headers: list[str]) -> tuple[int | None, int | None, int
     """Find the indices of version, date, and manager columns."""
     version_idx = None
     date_idx = None
+    cut_date_idx = None
     manager_idx = None
 
     for idx, header in enumerate(headers):
-        if "version" in header and "suffix" not in header:
+        if version_idx is None and "version" in header and "suffix" not in header:
             version_idx = idx
-        elif any(word in header for word in ["date", "cut date", "planned cut date"]):
+        if "cut" in header and "date" in header:
+            cut_date_idx = idx
+        elif date_idx is None and "date" in header:
             date_idx = idx
-        elif any(word in header for word in ["manager", "release manager"]):
+        if manager_idx is None and "manager" in header:
             manager_idx = idx
+
+    if cut_date_idx is not None:
+        date_idx = cut_date_idx
 
     console.print(
         f"  [dim]Column mapping - version: {version_idx}, date: {date_idx}, manager: {manager_idx}[/dim]"
@@ -227,7 +246,7 @@ def find_column_indices(headers: list[str]) -> tuple[int | None, int | None, int
     return version_idx, date_idx, manager_idx
 
 
-def parse_date_string(date_str: str) -> datetime | None:
+def parse_date_string(date_str: str, *, log_failures: bool = True) -> datetime | None:
     """Parse a date string in various formats."""
     date_formats = [
         "%d %b %Y",  # 09 Dec 2025
@@ -251,9 +270,10 @@ def parse_date_string(date_str: str) -> datetime | None:
         except ValueError:
             continue
 
-    console.print(
-        f"  [yellow]Could not parse date:[/yellow] '{date_str}' (tried {len(date_formats)} formats)"
-    )
+    if log_failures:
+        console.print(
+            f"  [yellow]Could not parse date:[/yellow] '{date_str}' (tried {len(date_formats)} formats)"
+        )
     return None
 
 
@@ -262,6 +282,37 @@ def extract_manager_first_name(release_manager: str) -> str:
     if "+" in release_manager:
         return release_manager.split("+")[0].strip().split()[0]
     return release_manager.split()[0] if release_manager else ""
+
+
+def extract_notes(cells: list[Any], headers: list[str]) -> str:
+    """Return the notes/scope cell when present."""
+    for idx, header in enumerate(headers):
+        if "note" in header or "scope" in header:
+            if idx < len(cells):
+                return cells[idx].get_text(strip=True)
+            return ""
+    return cells[-1].get_text(strip=True) if cells else ""
+
+
+def is_placeholder_version(version: str) -> bool:
+    """Return True for tentative versions that are not yet a real release."""
+    normalized = version.strip().lower()
+    return "?" in normalized or normalized in {"tbd", "n/a", "-"}
+
+
+def should_skip_release_row(date_str: str, release_manager: str, version: str | None, notes: str) -> bool:
+    """Skip rows that are not concrete planned releases."""
+    if not date_str:
+        return True
+    if not release_manager:
+        return True
+    if parse_date_string(release_manager, log_failures=False):
+        return True
+    if "no release" in notes.lower():
+        return True
+    if version is not None and is_placeholder_version(version):
+        return True
+    return False
 
 
 def generate_version_from_date(date: datetime) -> str:
@@ -276,6 +327,7 @@ def parse_table_row(
     date_idx: int | None,
     manager_idx: int | None,
     release_type: str,
+    headers: list[str],
 ) -> Release | None:
     """Parse a single table row into a Release object."""
     try:
@@ -283,10 +335,10 @@ def parse_table_row(
         date_str = cells[date_idx].get_text(strip=True) if date_idx is not None else ""
         release_manager = cells[manager_idx].get_text(strip=True) if manager_idx is not None else ""
         version = cells[version_idx].get_text(strip=True) if version_idx is not None else None
+        notes = extract_notes(cells, headers)
 
-        # Skip empty rows
-        if not date_str or not release_manager:
-            console.print(f"  [dim]Row {row_num}: Skipping empty row[/dim]")
+        if should_skip_release_row(date_str, release_manager, version, notes):
+            console.print(f"  [dim]Row {row_num}: Skipping non-release row[/dim]")
             return None
 
         # Parse date
@@ -341,11 +393,76 @@ def parse_table(table: Any, release_type: str) -> list[Release]:
             console.print(f"  [dim]Row {i}: Skipping (not enough cells)[/dim]")
             continue
 
-        release = parse_table_row(cells, i, version_idx, date_idx, manager_idx, release_type)
+        release = parse_table_row(cells, i, version_idx, date_idx, manager_idx, release_type, headers)
         if release:
             releases.append(release)
 
     return releases
+
+
+def as_naive_datetime(value: Any) -> datetime:
+    """Normalize icalendar date/datetime values to a naive datetime."""
+    if isinstance(value, datetime):
+        return value.replace(tzinfo=None) if value.tzinfo is not None else value
+    if isinstance(value, date):
+        return datetime.combine(value, datetime.min.time())
+    raise TypeError(f"Unsupported calendar date value: {type(value)!r}")
+
+
+def expand_recurring_component(component: Any, overridden_dates: set[date]) -> list[CalendarEntry]:
+    """Expand an RRULE master event, skipping dates that have explicit overrides."""
+    dtstart = component.decoded("dtstart")
+    start = as_naive_datetime(dtstart)
+    rrule = component.get("RRULE")
+    if rrule is None:
+        return []
+    try:
+        rule = rrulestr(rrule.to_ical().decode(), dtstart=start)
+    except ValueError:
+        entry = parse_calendar_component(component)
+        return [entry] if entry else []
+
+    summary = str(component.get("summary", ""))
+    description = component.get("description", "")
+    horizon = datetime.now() + timedelta(days=400)
+    entries: list[CalendarEntry] = []
+    for occurrence in rule:
+        occ = as_naive_datetime(occurrence)
+        if occ > horizon:
+            break
+        if occ.date() in overridden_dates:
+            continue
+        entries.append(
+            CalendarEntry(
+                summary=summary,
+                start_date=occ,
+                description=str(description) if description else None,
+            )
+        )
+    return entries
+
+
+def parse_calendar_data(calendar_data: bytes) -> list[CalendarEntry]:
+    """Parse VEVENTs from an iCal document, expanding recurring series."""
+    calendar = Calendar.from_ical(calendar_data)
+    components = [component for component in calendar.walk() if component.name == "VEVENT"]
+    overridden_dates: dict[str, set[date]] = {}
+    for component in components:
+        recurrence_id = component.get("RECURRENCE-ID")
+        uid = str(component.get("UID", ""))
+        if recurrence_id:
+            overridden_dates.setdefault(uid, set()).add(as_naive_datetime(recurrence_id.dt).date())
+
+    entries: list[CalendarEntry] = []
+    for component in components:
+        uid = str(component.get("UID", ""))
+        if component.get("RRULE") and not component.get("RECURRENCE-ID"):
+            entries.extend(expand_recurring_component(component, overridden_dates.get(uid, set())))
+            continue
+        entry = parse_calendar_component(component)
+        if entry:
+            entries.append(entry)
+    return entries
 
 
 def parse_calendar_component(component: Any) -> CalendarEntry | None:
@@ -399,22 +516,25 @@ def fetch_calendar_entries() -> list[CalendarEntry]:
                 sys.exit(1)
 
     console.print("[cyan]Parsing calendar entries...[/cyan]")
-    calendar = Calendar.from_ical(calendar_data)
-    entries = []
-
-    for component in calendar.walk():
-        entry = parse_calendar_component(component)
-        if entry:
-            entries.append(entry)
-
+    entries = parse_calendar_data(calendar_data)
     console.print(f"[green]Found {len(entries)} calendar entries[/green]")
     return entries
 
 
+def select_releases_to_verify(releases: list[Release], *, include_past: bool) -> list[Release]:
+    """Drop past wiki rows unless the caller asked to include them."""
+    if include_past:
+        return releases
+    today = date.today()
+    upcoming = [release for release in releases if release.date.date() >= today]
+    skipped = len(releases) - len(upcoming)
+    if skipped:
+        console.print(f"[dim]Skipping {skipped} past release(s)[/dim]")
+    return upcoming
+
+
 def normalize_name(name: str) -> str:
     """Normalize a name by removing accents and converting to lowercase."""
-    import unicodedata
-
     # Normalize unicode characters (NFD = decompose, then filter out combining marks)
     nfd = unicodedata.normalize("NFD", name)
     # Remove combining characters (accents)
@@ -454,8 +574,6 @@ def check_version_match(version: str, summary: str) -> bool:
 
 def check_manager_match(manager_name: str, summary: str) -> bool:
     """Check if manager's name appears in the calendar entry summary."""
-    import re
-
     normalized_manager = normalize_name(manager_name)
     normalized_summary = normalize_name(summary)
 
@@ -570,6 +688,14 @@ def load_html_content(args: argparse.Namespace) -> str:
     return html_content
 
 
+def load_calendar_entries(args: argparse.Namespace) -> list[CalendarEntry]:
+    """Load calendar entries from a local iCal file or the public feed."""
+    if args.load_ics:
+        console.print(f"[cyan]Loading calendar from file:[/cyan] {args.load_ics}")
+        return parse_calendar_data(Path(args.load_ics).read_bytes())
+    return fetch_calendar_entries()
+
+
 def validate_releases(releases: list[Release]) -> None:
     """Validate that releases were found, exit if not."""
     if not releases:
@@ -605,17 +731,27 @@ def main():
     parser.add_argument(
         "--load-html", metavar="FILE", help="Load Confluence HTML from a file instead of fetching"
     )
+    parser.add_argument(
+        "--load-ics", metavar="FILE", help="Load calendar entries from an iCal file instead of fetching"
+    )
+    parser.add_argument(
+        "--include-past",
+        action="store_true",
+        help="Also verify wiki rows whose dates are already in the past",
+    )
     args = parser.parse_args()
 
-    # Fetch and parse data
     html_content = load_html_content(args)
     releases = parse_confluence_releases(html_content)
     validate_releases(releases)
+    releases = select_releases_to_verify(releases, include_past=args.include_past)
+    if not releases:
+        console.print("[bold green]✓ No current or future releases to verify[/bold green]")
+        sys.exit(0)
 
-    calendar_entries = fetch_calendar_entries()
+    calendar_entries = load_calendar_entries(args)
     validate_calendar_entries(calendar_entries)
 
-    # Verify and exit with appropriate code
     all_matched = verify_releases(releases, calendar_entries)
     print_final_result(all_matched)
 
