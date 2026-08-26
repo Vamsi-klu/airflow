@@ -1,6 +1,6 @@
 
 #
-# This constraints file was automatically generated on 2026-08-21T09:00:27.090000
+# This constraints file was automatically generated on 2026-08-26T21:16:53.289204
 # via `uv sync --resolution highest` for the "main" branch of Airflow.
 # This variant of constraints install just the 'bare' 'apache-airflow' package build from the HEAD of
 # the branch, without installing any of the providers.
@@ -14,7 +14,7 @@ Mako==1.4.1
 MarkupSafe==3.0.3
 PyJWT==2.13.0
 PyYAML==6.0.3
-Pygments==2.20.0
+Pygments==2.21.0
 SQLAlchemy==2.0.52
 a2wsgi==1.10.10
 aiosmtplib==5.1.2
@@ -32,7 +32,7 @@ cachetools==6.2.6
 cadwyn==7.0.0
 certifi==2026.7.22
 cffi==2.1.1
-charset-normalizer==3.5.0
+charset-normalizer==3.5.1
 click==8.4.2
 colorlog==6.12.0
 cron_descriptor==2.1.0
@@ -52,7 +52,7 @@ h11==0.16.0
 httpcore==1.0.9
 httptools==0.8.0
 httpx==0.28.1
-idna==3.18
+idna==3.19
 importlib_metadata==8.9.0
 isoduration==20.11.0
 itsdangerous==2.2.0
@@ -92,7 +92,7 @@ pydantic_core==2.46.4
 pygtrie==2.5.0
 python-daemon==3.1.2
 python-dateutil==2.9.0.post0
-python-dotenv==1.2.2
+python-dotenv==1.2.3
 python-multipart==0.0.32
 python-slugify==8.0.4
 referencing==0.37.0
@@ -122,10 +122,10 @@ universal_pathlib==0.3.10
 urllib3==2.7.0
 uuid6==2025.0.1
 uv==0.12.5
-uvicorn==0.52.3
+uvicorn==0.52.4
 uvloop==0.22.1
 watchfiles==1.2.0
-websockets==15.0.1
+websockets==16.1.1
 wirerope==1.0.0
 wrapt==2.3.0
 zipp==4.1.0
