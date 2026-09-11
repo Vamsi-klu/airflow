@@ -135,7 +135,12 @@ class SQLExecuteQueryTrigger(BaseTrigger):
             return {_SQL_TYPE_KEY: "uuid", "v": str(value)}
         if isinstance(value, Mapping):
             return {str(key): SQLExecuteQueryTrigger._jsonsafe_value(item) for key, item in value.items()}
-        if isinstance(value, (list, tuple)):
+        if isinstance(value, tuple):
+            return {
+                _SQL_TYPE_KEY: "tuple",
+                "v": [SQLExecuteQueryTrigger._jsonsafe_value(item) for item in value],
+            }
+        if isinstance(value, list):
             return [SQLExecuteQueryTrigger._jsonsafe_value(item) for item in value]
         return str(value)
 
@@ -159,6 +164,8 @@ class SQLExecuteQueryTrigger(BaseTrigger):
                 return Decimal(raw)
             if kind == "uuid":
                 return UUID(raw)
+            if kind == "tuple":
+                return tuple(SQLExecuteQueryTrigger.deserialize_sql_value(item) for item in raw)
             return raw
         if isinstance(value, list):
             return [SQLExecuteQueryTrigger.deserialize_sql_value(item) for item in value]

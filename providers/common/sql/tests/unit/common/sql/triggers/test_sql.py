@@ -106,7 +106,7 @@ class TestSQLExecuteQueryTrigger:
         assert len(events) == 1
         assert events[0].payload == {
             "status": "success",
-            "results": rows,
+            "results": SQLExecuteQueryTrigger._jsonsafe_results(rows),
             "descriptions": [[["col1", 23, None, None, None, None, None]]],
         }
 
@@ -157,7 +157,7 @@ class TestSQLExecuteQueryTrigger:
         assert len(events) == 1
         assert events[0].payload == {
             "status": "success",
-            "results": rows,
+            "results": SQLExecuteQueryTrigger._jsonsafe_results(rows),
             "descriptions": [[["col1", 23, None, None, None, None, None]]],
         }
 
@@ -223,6 +223,7 @@ class TestSQLExecuteQueryTrigger:
         encoded = SQLExecuteQueryTrigger._jsonsafe_results(raw)
         decoded = SQLExecuteQueryTrigger.deserialize_sql_value(encoded)
         row = decoded[0]
+        assert isinstance(row, tuple)
         assert row[0] == Decimal("12.50")
         assert row[1] == datetime(2024, 1, 2, 3, 4, 5, tzinfo=timezone.utc)
         assert row[2] == date(2024, 1, 2)
