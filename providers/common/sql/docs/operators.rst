@@ -35,6 +35,9 @@ different databases. Parameters of the operators are:
 - ``handler`` (optional) the function that will be applied to the cursor. If it's ``None`` results won't returned (default: fetch_all_handler).
 - ``split_statements`` (optional) if split single SQL string into statements and run separately (default: False).
 - ``return_last`` (optional) depends ``split_statements`` and if it's ``True`` this parameter is used to return the result of only last statement or all split statements (default: True).
+- ``deferrable`` (optional) defaults to False and does not use the ``default_deferrable`` Airflow configuration. Currently only ``PostgresHook`` with psycopg 3 provides a native async path. The operator validates that capability on the worker before deferring. Using ``default_deferrable`` would fail unsupported hooks, so this operator stays opt-in.
+- ``enforce_read_only`` (optional, deferrable only) defaults to True. Triggerer restarts re-run the SQL, so writes are blocked unless you opt out with idempotent statements.
+- Deferred result rows travel through a ``TriggerEvent`` and are bounded to 1 MiB. Larger results should use ``deferrable=False`` or unload to object storage.
 
 The example below shows how to instantiate the SQLExecuteQueryOperator task.
 

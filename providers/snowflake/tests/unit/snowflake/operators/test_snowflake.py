@@ -114,6 +114,14 @@ class TestSnowflakeOperatorForParams:
             default_args={},
         )
 
+    def test_sql_api_operator_keeps_explicit_deferrable(self):
+        operator = SnowflakeSqlApiOperator(
+            task_id="snowflake_deferrable_check",
+            sql="SELECT 1",
+            deferrable=True,
+        )
+        assert operator.deferrable is True
+
 
 @pytest.fixture(autouse=True)
 def setup_connections(create_connection_without_db):

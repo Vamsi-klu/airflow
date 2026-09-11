@@ -17,38 +17,84 @@
 # under the License.
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+import base64
+import json
+from collections.abc import (
+    AsyncIterator,
+    Iterable,
+    Mapping,
+    Sequence,
+)
+from datetime import date, datetime, time, timedelta
+from decimal import Decimal
+from typing import TYPE_CHECKING, Any, cast
+from uuid import UUID
 
-from airflow.providers.common.compat.sdk import AirflowException, BaseHook
+from asgiref.sync import sync_to_async
+
+from airflow.providers.common.compat.hook import get_async_hook
 from airflow.providers.common.compat.version_compat import AIRFLOW_V_3_2_PLUS
+from airflow.providers.common.sql.hooks.handlers import fetch_all_handler
 from airflow.providers.common.sql.hooks.sql import DbApiHook
 from airflow.triggers.base import BaseTrigger, TriggerEvent
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator
-    from typing import Any
+    from collections.abc import Callable
+
+_SQL_TYPE_KEY = "__af_sql_type__"
+MAX_TRIGGER_RESULT_BYTES = 1_048_576
 
 
 class SQLExecuteQueryTrigger(BaseTrigger):
     """
-    A trigger that executes SQL code in async mode.
+    A SQL trigger that executes SQL code in async mode.
+
+    The query runs in the triggerer, but no user code does: when ``fetch_results`` is set the rows are
+    fetched with the built-in :func:`fetch_all_handler` and returned, together with the cursor
+    descriptions, in the ``TriggerEvent``. Any user-provided ``handler`` is applied on the worker in
+    ``SQLExecuteQueryOperator.execute_complete`` -- keeping user code out of the triggerer's event loop
+    and out of its (bundle-less) import path.
+
+    Newly added execution flags keep defaults so existing callers that only pass ``sql``, ``conn_id``,
+    and ``hook_params`` stay valid. Those extra flags are keyword-only.
 
     :param sql: the sql statement to be executed (str) or a list of sql statements to execute
     :param conn_id: the connection ID used to connect to the database
     :param hook_params: hook parameters
+    :param autocommit: whether each statement should autocommit
+    :param split_statements: whether to split a single SQL string; ``None`` uses the hook default
+    :param return_last: whether to return only the last statement result
+    :param parameters: SQL parameters
+    :param fetch_results: whether the query results should be fetched and returned to the worker
+    :param read_only: whether to request a read-only session on native async hooks
+    :param database: optional database/schema override matching the operator ``database`` argument
     """
 
     def __init__(
         self,
-        sql: str | list[str],
+        sql: str | Iterable[str],
         conn_id: str,
         hook_params: dict | None = None,
-        **kwargs,
+        *,
+        autocommit: bool = False,
+        split_statements: bool | None = None,
+        return_last: bool = True,
+        parameters: Iterable[Any] | Mapping[str, Any] | None = None,
+        fetch_results: bool = True,
+        read_only: bool = False,
+        database: str | None = None,
     ):
-        super().__init__(**kwargs)
+        super().__init__()
         self.sql = sql
         self.conn_id = conn_id
         self.hook_params = hook_params
+        self.autocommit = autocommit
+        self.parameters = parameters
+        self.fetch_results = fetch_results
+        self.split_statements = split_statements
+        self.return_last = return_last
+        self.read_only = read_only
+        self.database = database
 
     def serialize(self) -> tuple[str, dict[str, Any]]:
         """Serialize the SQLExecuteQueryTrigger arguments and classpath."""
@@ -58,48 +104,200 @@ class SQLExecuteQueryTrigger(BaseTrigger):
                 "sql": self.sql,
                 "conn_id": self.conn_id,
                 "hook_params": self.hook_params,
+                "autocommit": self.autocommit,
+                "parameters": self.parameters,
+                "fetch_results": self.fetch_results,
+                "split_statements": self.split_statements,
+                "return_last": self.return_last,
+                "read_only": self.read_only,
+                "database": self.database,
             },
         )
 
-    def get_hook(self) -> DbApiHook:
+    @staticmethod
+    def _jsonsafe_value(value: Any) -> Any:
+        """Convert a driver value into a JSON-serializable form that can be reconstructed."""
+        if value is None or isinstance(value, (str, int, float, bool)):
+            return value
+        if isinstance(value, bytes):
+            return {_SQL_TYPE_KEY: "bytes", "v": base64.b64encode(value).decode("ascii")}
+        if isinstance(value, datetime):
+            return {_SQL_TYPE_KEY: "datetime", "v": value.isoformat()}
+        if isinstance(value, date):
+            return {_SQL_TYPE_KEY: "date", "v": value.isoformat()}
+        if isinstance(value, time):
+            return {_SQL_TYPE_KEY: "time", "v": value.isoformat()}
+        if isinstance(value, timedelta):
+            return {_SQL_TYPE_KEY: "timedelta", "v": value.total_seconds()}
+        if isinstance(value, Decimal):
+            return {_SQL_TYPE_KEY: "decimal", "v": str(value)}
+        if isinstance(value, UUID):
+            return {_SQL_TYPE_KEY: "uuid", "v": str(value)}
+        if isinstance(value, Mapping):
+            return {str(key): SQLExecuteQueryTrigger._jsonsafe_value(item) for key, item in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [SQLExecuteQueryTrigger._jsonsafe_value(item) for item in value]
+        return str(value)
+
+    @staticmethod
+    def deserialize_sql_value(value: Any) -> Any:
+        """Rebuild values produced by :meth:`_jsonsafe_value`."""
+        if isinstance(value, dict) and _SQL_TYPE_KEY in value:
+            kind = value[_SQL_TYPE_KEY]
+            raw = value.get("v")
+            if kind == "bytes":
+                return base64.b64decode(raw)
+            if kind == "datetime":
+                return datetime.fromisoformat(raw)
+            if kind == "date":
+                return date.fromisoformat(raw)
+            if kind == "time":
+                return time.fromisoformat(raw)
+            if kind == "timedelta":
+                return timedelta(seconds=raw)
+            if kind == "decimal":
+                return Decimal(raw)
+            if kind == "uuid":
+                return UUID(raw)
+            return raw
+        if isinstance(value, list):
+            return [SQLExecuteQueryTrigger.deserialize_sql_value(item) for item in value]
+        if isinstance(value, dict):
+            return {key: SQLExecuteQueryTrigger.deserialize_sql_value(item) for key, item in value.items()}
+        return value
+
+    @staticmethod
+    def _jsonsafe_results(results: Any) -> Any:
+        return SQLExecuteQueryTrigger._jsonsafe_value(results)
+
+    @staticmethod
+    def _jsonsafe_descriptions(
+        descriptions: list[Sequence[Sequence] | None],
+    ) -> list[list[list[Any]] | None]:
+        """
+        Normalise cursor descriptions into a JSON-serializable form for the ``TriggerEvent``.
+
+        ``cursor.description`` is a sequence of column 7-tuples whose ``type_code`` can be a
+        driver-specific object that is not JSON-serializable; such values are stringified while
+        JSON-native fields (column names, sizes, precision, ...) are preserved.
+        """
+        safe: list[list[list[Any]] | None] = []
+        for description in descriptions:
+            if description is None:
+                safe.append(None)
+                continue
+            safe.append(
+                [
+                    [
+                        field if isinstance(field, (str, int, float, bool, type(None))) else str(field)
+                        for field in column
+                    ]
+                    for column in description
+                ]
+            )
+        return safe
+
+    @staticmethod
+    def check_result_bound(results: Any, *, limit: int = MAX_TRIGGER_RESULT_BYTES) -> None:
+        """Reject result payloads that would flood the metadata database via TriggerEvent."""
+        encoded = json.dumps(results, default=str)
+        if len(encoded.encode("utf-8")) > limit:
+            raise ValueError(
+                f"Deferred SQL result is {len(encoded.encode('utf-8'))} bytes, above the "
+                f"{limit} byte TriggerEvent limit. Use deferrable=False, drop the handler, or "
+                "unload large results to object storage instead of returning them through XCom."
+            )
+
+    def _apply_database_override(self, hook: DbApiHook) -> None:
+        if not self.database:
+            return
+        if getattr(hook, "conn_type", None) == "postgres":
+            hook.database = self.database
+        else:
+            hook.schema = self.database
+
+    async def aget_hook(self) -> DbApiHook:
         """
         Return DbApiHook.
 
         :return: DbApiHook for this connection
         """
-        connection = BaseHook.get_connection(self.conn_id)
-        hook = connection.get_hook(hook_params=self.hook_params)
+        hook = await get_async_hook(self.conn_id, hook_params=self.hook_params)
         if not isinstance(hook, DbApiHook):
-            raise AirflowException(
-                f"You are trying to use `common-sql` with {hook.__class__.__name__},"
-                " but its provider does not support it. Please upgrade the provider to a version that"
-                " supports `common-sql`. The hook class should be a subclass of"
-                f" `{hook.__class__.__module__}.{hook.__class__.__name__}`."
-                f" Got {hook.__class__.__name__} hook with class hierarchy: {hook.__class__.mro()}"
+            raise TypeError(
+                f"You are trying to use the SQLExecuteQueryOperator in deferrable mode with {hook.__class__.__name__},"
+                " but its provider does not support this. Please set deferrable=False"
+                f" Got {hook.__class__.__name__} with class hierarchy: {hook.__class__.mro()}"
+            )
+        self._apply_database_override(hook)
+        if self.read_only and not (hook.supports_async_execution() and hook.supports_readonly_execution()):
+            raise NotImplementedError(
+                f"{hook.__class__.__name__} does not support read-only execution, so it cannot run a"
+                " deferred query safely (a triggerer restart could re-run it). Set"
+                " enforce_read_only=False to run without the read-only guard if the query is"
+                " idempotent, or deferrable=False to run it on the worker."
             )
         return hook
 
-    async def _get_records(self) -> Any:
-        from asgiref.sync import sync_to_async
+    def _run_kwargs(self, *, handler) -> dict[str, Any]:
+        kwargs: dict[str, Any] = {
+            "sql": self.sql,
+            "autocommit": self.autocommit,
+            "parameters": self.parameters,
+            "handler": handler,
+            "return_last": self.return_last,
+        }
+        if self.split_statements is not None:
+            kwargs["split_statements"] = self.split_statements
+        return kwargs
 
-        hook = self.get_hook()
+    async def _run_query(self, hook: DbApiHook, fetch_results: bool):
+        """
+        Run the query against ``hook``, using its native async driver if available.
 
+        Hooks without a real async driver (:meth:`DbApiHook.supports_async_execution`) fall back to
+        running the synchronous :meth:`DbApiHook.run` in a worker thread, matching the compatibility the
+        `GenericTransfer` operator has always relied on for arbitrary DB-specific hooks.
+        """
+        handler = fetch_all_handler if fetch_results else None
+        kwargs = self._run_kwargs(handler=handler)
+        if hook.supports_async_execution():
+            return await hook.arun(read_only=self.read_only, **kwargs)
         if AIRFLOW_V_3_2_PLUS:
             # This is only supported from Airflow 3.2 or higher due to added async support in CommsDecoder
-            return await sync_to_async(hook.get_records)(self.sql)
-        return hook.get_records(self.sql)
+            # `sync_to_async` erases `run`'s overloads, so it is cast to a plain callable first.
+            arun_in_thread = sync_to_async(cast("Callable[..., Any]", hook.run))
+            return await arun_in_thread(**kwargs)
+        return hook.run(**kwargs)
 
     async def run(self) -> AsyncIterator[TriggerEvent]:
         try:
+            hook = await self.aget_hook()
+
             self.log.info("Extracting data from %s", self.conn_id)
             self.log.info("Executing: \n %s", self.sql)
-            self.log.info("Reading records from %s", self.conn_id)
 
-            results = await self._get_records()
+            if self.fetch_results:
+                results = await self._run_query(hook, fetch_results=True)
+                safe_results = self._jsonsafe_results(results)
+                self.check_result_bound(safe_results)
 
-            self.log.info("Reading records from %s done!", self.conn_id)
-            self.log.debug("results: %s", results)
-            yield TriggerEvent({"status": "success", "results": results})
+                self.log.info("Executing query from %s done!", self.conn_id)
+                self.log.debug("results: %s", results)
+                yield TriggerEvent(
+                    {
+                        "status": "success",
+                        "results": safe_results,
+                        "descriptions": self._jsonsafe_descriptions(hook.descriptions),
+                    }
+                )
+
+            else:
+                await self._run_query(hook, fetch_results=False)
+
+                self.log.info("Executing query from %s done!", self.conn_id)
+                yield TriggerEvent({"status": "success"})
+
         except Exception as e:
-            self.log.exception("An error occurred: %s", e)
-            yield TriggerEvent({"status": "failure", "message": str(e)})
+            self.log.error("status: error, message: %s", str(e))
+            yield TriggerEvent({"status": "error", "message": str(e)})

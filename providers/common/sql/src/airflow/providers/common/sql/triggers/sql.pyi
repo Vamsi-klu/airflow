@@ -29,16 +29,33 @@
 #
 """Definition of the public interface for airflow.providers.common.sql.triggers.sql."""
 
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Iterable, Mapping
 from typing import Any
 
 from airflow.providers.common.sql.hooks.sql import DbApiHook as DbApiHook
 from airflow.triggers.base import BaseTrigger as BaseTrigger, TriggerEvent as TriggerEvent
 
+MAX_TRIGGER_RESULT_BYTES: int
+
 class SQLExecuteQueryTrigger(BaseTrigger):
     def __init__(
-        self, sql: str | list[str], conn_id: str, hook_params: dict | None = None, **kwargs
+        self,
+        sql: str | Iterable[str],
+        conn_id: str,
+        hook_params: dict | None = None,
+        *,
+        autocommit: bool = False,
+        split_statements: bool | None = None,
+        return_last: bool = True,
+        parameters: Iterable[Any] | Mapping[str, Any] | None = None,
+        fetch_results: bool = True,
+        read_only: bool = False,
+        database: str | None = None,
     ) -> None: ...
     def serialize(self) -> tuple[str, dict[str, Any]]: ...
-    def get_hook(self) -> DbApiHook: ...
+    @staticmethod
+    def deserialize_sql_value(value: Any) -> Any: ...
+    @staticmethod
+    def check_result_bound(results: Any, *, limit: int = ...) -> None: ...
+    async def aget_hook(self) -> DbApiHook: ...
     async def run(self) -> AsyncIterator[TriggerEvent]: ...  # type: ignore

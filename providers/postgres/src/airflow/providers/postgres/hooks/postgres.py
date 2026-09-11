@@ -161,6 +161,34 @@ class PostgresHook(DbApiHook):
         "sqlalchemy_query",
         "azure_conn_id",
     }
+    async_conn_extra_allowlist = frozenset(
+        {
+            "sslmode",
+            "sslrootcert",
+            "sslcert",
+            "sslkey",
+            "sslcrl",
+            "sslpassword",
+            "sslnegotiation",
+            "connect_timeout",
+            "application_name",
+            "keepalives",
+            "keepalives_idle",
+            "keepalives_interval",
+            "keepalives_count",
+            "client_encoding",
+            "gssencmode",
+            "krbsrvname",
+            "gsslib",
+            "target_session_attrs",
+            "channel_binding",
+            "options",
+            "passfile",
+            "requiressl",
+            "ssl_min_protocol_version",
+            "ssl_max_protocol_version",
+        }
+    )
     default_azure_oauth_scope = "https://ossrdbms-aad.database.windows.net/.default"
 
     def __init__(
@@ -270,8 +298,8 @@ class PostgresHook(DbApiHook):
 
         return f"airflow_cursor_{uuid.uuid4().hex}"
 
-    def get_conn(self) -> CompatConnection:
-        """Establish a connection to a postgres database."""
+    def _build_conn_args(self, *, async_conn: bool = False) -> tuple[dict[str, Any], Any]:
+        """Build base connection arguments from the Airflow connection."""
         conn = deepcopy(self.connection)
 
         if conn.extra_dejson.get("iam", False):
@@ -291,20 +319,49 @@ class PostgresHook(DbApiHook):
         if self.options:
             conn_args["options"] = self.options
 
-        # Add extra connection arguments
         for arg_name, arg_val in conn.extra_dejson.items():
-            if arg_name not in self.ignored_extra_options:
-                conn_args[arg_name] = arg_val
+            if arg_name in self.ignored_extra_options:
+                continue
+            if async_conn and arg_name not in self.async_conn_extra_allowlist:
+                continue
+            conn_args[arg_name] = arg_val
 
+        return conn_args, conn
+
+    def get_conn(self) -> CompatConnection:
+        """Establish a connection to a postgres database."""
+        conn_args, conn = self._build_conn_args()
         raw_cursor = conn.extra_dejson.get("cursor")
-
         if raw_cursor:
             key, value = self._get_cursor_config(raw_cursor)
             conn_args[key] = value
-
         self.conn = self._create_connection(conn_args)
-
         return self.conn
+
+    async def aget_conn(self) -> Any:
+        """Establish an async connection to a postgres database."""
+        if not USE_PSYCOPG3:
+            raise NotImplementedError("Async connections for PostgresHook require psycopg3.")
+        from psycopg import AsyncConnection
+
+        conn_args, conn = self._build_conn_args(async_conn=True)
+
+        raw_cursor = conn.extra_dejson.get("cursor")
+        if raw_cursor:
+            conn_args["row_factory"] = self._get_cursor(raw_cursor)
+
+        connection = await AsyncConnection.connect(**cast("Any", conn_args))
+
+        register_default_adapters(connection)
+
+        if self.enable_log_db_messages and hasattr(connection, "add_notice_handler"):
+            connection.add_notice_handler(self._notice_handler)
+
+        return connection
+
+    async def _aenter_read_only(self, conn) -> None:
+        """Put the async connection's next transaction into read-only mode."""
+        await conn.set_read_only(True)
 
     @overload
     def get_df(
